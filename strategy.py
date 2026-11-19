@@ -4,6 +4,12 @@ import yfinance as yf, pandas as pd, numpy as np
 
 warnings.filterwarnings("ignore")
 
+# ==========================================
+# 核心设置：全新起跑日期（从这一天开始 0 仓位、$10万现金起步）
+# ==========================================
+LIVE_START = "2026-11-19"
+INIT_CAP = 100000.0
+
 MY_50 = [
     "NOW","PANW","CRWD","ANET","VEEV","TTD","FICO","PLTR","DDOG","AMD",
     "SNPS","ISRG","BSX","IDXX","VRTX","AMZN","TSLA","NFLX","UBER","MELI",
@@ -14,13 +20,13 @@ MY_50 = [
 ]
 
 N_HIGH, MAX_SLOTS, SL_ATR, TRAIL_ATR, TIME_STOP = 20, 12, 3.5, 4.5, 45
-TARGET_VOL, SLIP, D_CASH, INIT_CAP = 0.14, 0.00075, 0.04 / 252.0, 100000.0
+TARGET_VOL, SLIP, D_CASH = 0.14, 0.00075, 0.04 / 252.0
 
-print("🌐 拉取 50 股 + SPY + QQQ + GLD 行情...")
+print("🌐 拉取 50 股 + SPY + QQQ + GLD 行情（用于计算指标）...")
 data_dict, all_t = {}, MY_50 + ["SPY", "QQQ", "GLD"]
 for i in range(0, len(all_t), 10):
     batch = all_t[i:i+10]
-    df_b = yf.download(batch, start="2023-01-01", interval="1d", group_by="ticker", progress=False, threads=False, timeout=20)
+    df_b = yf.download(batch, start="2025-01-01", interval="1d", group_by="ticker", progress=False, threads=False, timeout=20)
     for t in batch:
         try:
             sub = df_b[t].dropna() if len(batch) > 1 else df_b.dropna()
@@ -59,13 +65,12 @@ for i, t in enumerate(MY_50):
     pos52_arr[i, idx0:] = ((sc - sl.rolling(252).min()) / (sh.rolling(252).max() - sl.rolling(252).min() + 1e-6)).fillna(0.5).values
     if idx0 + 60 < T: valid_arr[i, idx0 + 60:] = True
 
-# 1. 运行 V0 底座（2023-07 预热，2024-01 正式记账）
-warm_idx = int(np.searchsorted(dates, pd.Timestamp("2023-07-01")))
-start_idx = int(np.searchsorted(dates, pd.Timestamp("2024-01-01")))
+# 1. 从 LIVE_START 起全新 0 仓位记账
+start_idx = int(np.searchsorted(dates, pd.Timestamp(LIVE_START)))
 cash, holdings, trade_logs = 1.0, {}, []
 eq_v0, r_v0 = np.ones(T), np.zeros(T)
 
-for t in range(warm_idx, T):
+for t in range(start_idx, T):
     v_now = valid_arr[:, t] & valid_arr[:, t-1]
     cash *= (1.0 + D_CASH)
     to_sell = []
@@ -80,8 +85,7 @@ for t in range(warm_idx, T):
         if rsn:
             sp = float(O_arr[i, t])
             cash += p['sh'] * sp * (1.0 - SLIP)
-            if t >= start_idx:
-                trade_logs.append({"t": MY_50[i].replace("-","."), "bp": round(p['ep'],2), "sd": dates[t].strftime("%m-%d"), "sp": round(sp,2), "pnl": round((sp*(1-2*SLIP)/p['ep']-1)*100,1), "rsn": rsn})
+            trade_logs.append({"t": MY_50[i].replace("-","."), "bp": round(p['ep'],2), "sd": dates[t].strftime("%m-%d"), "sp": round(sp,2), "pnl": round((sp*(1-2*SLIP)/p['ep']-1)*100,1), "rsn": rsn})
             to_sell.append(i)
     for i in to_sell: del holdings[i]
 
@@ -98,19 +102,29 @@ for t in range(warm_idx, T):
     eq_now = cash + sum(p['sh'] * float(C_arr[i, t]) for i, p in holdings.items())
     eq_v0[t], r_v0[t] = eq_now, eq_now / eq_v0[t-1] - 1.0
 
-# 2. 叠加 Sub-B：波动率控制 + 黄金/短债避险
-vol20_s = pd.Series(r_v0).rolling(20).std() * np.sqrt(252.0)
-w_stock = np.clip(TARGET_VOL / np.clip(vol20_s.shift(1).fillna(TARGET_VOL).values, 0.06, None), 0.30, 1.0)
-safe_r = np.array([gld_r[t] if (t > 0 and gld_bull[t-1]) else D_CASH for t in range(T)])
-r_subB = w_stock * r_v0 + (1.0 - w_stock) * safe_r
-eq_subB = INIT_CAP * np.cumprod(1.0 + r_subB[start_idx:])
+# 2. 叠加 Sub-B：波动率控制 + 黄金/短债避险（实盘未满20天时默认按目标波动率14%起步）
+live_days = max(0, T - start_idx)
+if live_days > 0:
+    vol20_s = pd.Series(r_v0).rolling(20).std() * np.sqrt(252.0)
+    w_stock = np.clip(TARGET_VOL / np.clip(vol20_s.shift(1).fillna(TARGET_VOL).values, 0.06, None), 0.30, 1.0)
+    w_stock[:min(T, start_idx + 20)] = 1.0
+    safe_r = np.array([gld_r[t] if (t > 0 and gld_bull[t-1]) else D_CASH for t in range(T)])
+    r_subB = w_stock * r_v0 + (1.0 - w_stock) * safe_r
+    eq_subB = INIT_CAP * np.cumprod(1.0 + r_subB[start_idx:])
+    tot_eq, tot_ret = float(eq_subB[-1]), (float(eq_subB[-1]) / INIT_CAP - 1) * 100
+    max_dd = float((eq_subB / np.maximum.accumulate(eq_subB) - 1).min() * 100)
+    base_i = max(0, start_idx - 1)
+    qqq_ret = (qqq_c[-1] / qqq_c[base_i] - 1) * 100
+    spy_ret = (spy_c[-1] / spy_c[base_i] - 1) * 100
+    cur_vol = float(vol20_s.iloc[-1]) if (live_days >= 20 and not np.isnan(vol20_s.iloc[-1])) else TARGET_VOL
+else:
+    tot_eq, tot_ret, max_dd, qqq_ret, spy_ret, cur_vol = INIT_CAP, 0.0, 0.0, 0.0, 0.0, TARGET_VOL
 
-cur_vol = float(vol20_s.iloc[-1]) if not np.isnan(vol20_s.iloc[-1]) else TARGET_VOL
 tmr_scale = float(np.clip(TARGET_VOL / max(cur_vol, 0.06), 0.30, 1.0))
 tmr_safe = 1.0 - tmr_scale
 safe_txt = "黄金 GLD" if gld_bull[-1] else "4% 现金短债"
 
-# 3. 扫描明日开盘信号
+# 3. 扫描下一交易日开盘信号
 n_sells, n_buys = [], []
 for i, p in holdings.items():
     cc, catr = float(C_arr[i, -1]), float(ATR_arr[i, -1])
@@ -126,17 +140,13 @@ if free_tmr > 0:
         n_buys.append((MY_50[i].replace("-","."), round(float(C_arr[i, -1]), 2), round(float(pos52_arr[i, -1])*100, 1)))
 
 # 4. 生成手机端暗黑 PWA 网页 (index.html)
-tot_eq, tot_ret = float(eq_subB[-1]), (float(eq_subB[-1]) / INIT_CAP - 1) * 100
-max_dd = float((eq_subB / np.maximum.accumulate(eq_subB) - 1).min() * 100)
-qqq_ret = (qqq_c[-1] / qqq_c[start_idx] - 1) * 100
-spy_ret = (spy_c[-1] / spy_c[start_idx] - 1) * 100
 bj_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%m-%d %H:%M")
 mkt_date = dates[-1].strftime("%Y-%m-%d")
 
-sig_html = f"<div class='sig macro'>⚖️ <b>明日总仓位</b>：股票 <b>{tmr_scale*100:.0f}%</b> + 避险 <b>{tmr_safe*100:.0f}% ({safe_txt})</b><br><span class='sub'>当前20日年化波动率: {cur_vol*100:.1f}% (目标≤14%)</span></div>"
+sig_html = f"<div class='sig macro'>⚖️ <b>明日总仓位上限</b>：股票 <b>{tmr_scale*100:.0f}%</b> + 避险 <b>{tmr_safe*100:.0f}% ({safe_txt})</b><br><span class='sub'>实盘已运行 {live_days} 个交易日 · 波动率: {cur_vol*100:.1f}%</span></div>"
 for t, cc, rsn in n_sells: sig_html += f"<div class='sig sell'>🔴 <b>明日开盘平仓 {t}</b> (${cc:.2f}) · {rsn}</div>"
 for t, cc, p52 in n_buys: sig_html += f"<div class='sig buy'>🟢 <b>明日开盘开仓 {t}</b> (${cc:.2f}) · 52周分位 {p52}%</div>"
-if not n_sells and not n_buys: sig_html += "<div class='sig none'>☕ 明日开盘无个股开/平仓信号，按仓位比例持有。</div>"
+if not n_sells and not n_buys: sig_html += "<div class='sig none'>☕ 明日开盘暂无新开/平仓信号，耐心等待买点。</div>"
 
 hold_rows = []
 for i, p in holdings.items():
@@ -171,19 +181,19 @@ th{{text-align:left;padding:8px 9px;background:#1c2331;color:#848e9c;font-weight
 td{{padding:8px 9px;border-top:1px solid #222a38}}
 .tag{{font-size:10px;padding:1px 4px;border-radius:3px;background:#1e293b;color:#38bdf8;margin-left:3px}}
 </style></head><body>
-<h1>📈 Sub-B 量化模拟盘</h1><div class="sub">行情截至 {mkt_date} · 更新于 {bj_time} 北京时间</div>
+<h1>📈 Sub-B 量化模拟盘</h1><div class="sub">起跑日 {LIVE_START} · 行情截至 {mkt_date} · 更新于 {bj_time}</div>
 <div class="grid">
-  <div class="card"><div class="sub">模拟总资产 (2024起$10万)</div><div class="val {'pos' if tot_ret>=0 else 'neg'}">${tot_eq:,.0f}</div><div class="sub">累计 {tot_ret:+.1f}% | 回撤 {max_dd:.1f}%</div></div>
-  <div class="card"><div class="sub">同期基准对比 (2024至今)</div><div class="val" style="font-size:14px;margin-top:6px">QQQ: {qqq_ret:+.1f}%<br>SPY: {spy_ret:+.1f}%</div></div>
+  <div class="card"><div class="sub">模拟总资产 (初始$10万)</div><div class="val {'pos' if tot_ret>=0 else 'neg'}">${tot_eq:,.0f}</div><div class="sub">累计 {tot_ret:+.1f}% | 回撤 {max_dd:.1f}%</div></div>
+  <div class="card"><div class="sub">同期基准 ({LIVE_START}起)</div><div class="val" style="font-size:14px;margin-top:6px">QQQ: {qqq_ret:+.1f}%<br>SPY: {spy_ret:+.1f}%</div></div>
 </div>
 <div class="sec">⚡ 明日开盘指令</div>{sig_html}
 <div class="sec">💼 当前模拟持仓 ({len(holdings)}/{MAX_SLOTS} 只 · 蓝标为总仓占比)</div>
-<div class="wrap"><table><thead><tr><th>标的/占比</th><th>成本/现价</th><th>浮盈</th><th>动态止损线</th></tr></thead><tbody>{h_html or "<tr><td colspan='4' class='sub'>当前空仓</td></tr>"}</tbody></table></div>
-<div class="sec">🧾 最近 12 笔已平仓记录</div>
-<div class="wrap"><table><thead><tr><th>标的/日期</th><th>买→卖</th><th>盈亏</th><th>离场原因</th></tr></thead><tbody>{l_html}</tbody></table></div>
+<div class="wrap"><table><thead><tr><th>标的/占比</th><th>成本/现价</th><th>浮盈</th><th>动态止损线</th></tr></thead><tbody>{h_html or "<tr><td colspan='4' class='sub'>当前空仓（100% 现金待命）</td></tr>"}</tbody></table></div>
+<div class="sec">🧾 实盘已平仓记录</div>
+<div class="wrap"><table><thead><tr><th>标的/日期</th><th>买→卖</th><th>盈亏</th><th>离场原因</th></tr></thead><tbody>{l_html or "<tr><td colspan='4' class='sub'>暂无平仓记录</td></tr>"}</tbody></table></div>
 <div class="sub" style="text-align:center;margin:18px 0">Sub-B: 双突破底座 · 14%波动率控制 · 黄金GLD/短债避险</div>
 </body></html>"""
 
 with open("index.html", "w", encoding="utf-8") as f:
     f.write(html)
-print(f"✅ Sub-B 模拟盘更新完成！总资产: ${tot_eq:,.0f} ({tot_ret:+.1f}%)")
+print(f"✅ Sub-B 模拟盘初始化完成！当前持仓: {len(holdings)} 只 | 总资产: ${tot_eq:,.0f}")
